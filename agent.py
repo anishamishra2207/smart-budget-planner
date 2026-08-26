@@ -7,11 +7,11 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from dotenv import load_dotenv
-from openai import OpenAI
+import openai
 
 
 ENV_FILE = Path(__file__).resolve().parent / ".env"
-load_dotenv(dotenv_path=ENV_FILE)
+load_dotenv(dotenv_path=ENV_FILE, override=True)
 
 MODEL = "openai/gpt-oss-120b"
 GROQ_API_URL = "https://api.groq.com/openai/v1"
@@ -41,6 +41,7 @@ class BudgetState:
         self.total_budget = float(total_budget)
         self.expenses: List[Expense] = []
         self.savings_goal: Optional[float] = None
+        self.category_limits: Dict[str, float] = {}  # Category spending limits
 
     @property
     def total_spent(self) -> float:
@@ -86,7 +87,11 @@ class BudgetState:
 
         savings_reserved = self.savings_goal or 0.0
         available_after_savings = self.remaining_balance - savings_reserved
-        return {
+        
+        # Get category overspending warnings
+        warnings = self.get_category_overspending()
+        
+        result = {
             "total_budget": round(self.total_budget, 2),
             "total_spent": round(self.total_spent, 2),
             "remaining_balance": round(self.remaining_balance, 2),
@@ -99,6 +104,12 @@ class BudgetState:
             "overspending": self.remaining_balance < 0,
             "savings_goal_at_risk": available_after_savings < 0,
         }
+        
+        # Add warnings if any categories are overspent
+        if warnings:
+            result["category_overspending_warnings"] = warnings
+        
+        return result
 
     def set_savings_goal(self, amount: float) -> Dict[str, Any]:
         """Set a savings target and report whether current spending exceeds it."""
@@ -113,6 +124,47 @@ class BudgetState:
             "savings_goal_at_risk": self.remaining_balance - amount < 0,
         }
 
+    def set_category_limit(self, category: str, limit: float) -> Dict[str, Any]:
+        """Set a spending limit for a specific category."""
+        if not category.strip():
+            raise ValueError("category must not be empty")
+        if limit <= 0:
+            raise ValueError("category limit must be greater than zero")
+
+        category = category.strip()
+        self.category_limits[category] = float(limit)
+        return {
+            "message": f"Category limit for '{category}' set to ${limit:.2f}.",
+            "category": category,
+            "limit": round(limit, 2),
+        }
+
+    def get_category_overspending(self) -> Dict[str, Dict[str, Any]]:
+        """Check all categories for overspending and return warnings."""
+        warnings = {}
+        
+        # Calculate spending by category
+        category_spending: Dict[str, float] = {}
+        for expense in self.expenses:
+            category_spending[expense.category] = (
+                category_spending.get(expense.category, 0.0) + expense.amount
+            )
+        
+        # Check each category against its limit
+        for category, limit in self.category_limits.items():
+            spent = category_spending.get(category, 0.0)
+            if spent > limit:
+                overage = spent - limit
+                warnings[category] = {
+                    "category": category,
+                    "limit": round(limit, 2),
+                    "spent": round(spent, 2),
+                    "overage": round(overage, 2),
+                    "warning": f"WARNING: {category} spending has exceeded its limit by ${overage:.2f}.",
+                }
+        
+        return warnings
+
 
 Tool = Callable[..., Dict[str, Any]]
 
@@ -120,27 +172,31 @@ Tool = Callable[..., Dict[str, Any]]
 class BudgetAgent:
     """Tool-calling agent with in-memory state and persistent chat history."""
 
-    def __init__(self, total_budget: float, client: Optional[OpenAI] = None) -> None:
+    def __init__(self, total_budget: float, client: Optional[openai.OpenAI] = None) -> None:
         self.state = BudgetState(total_budget)
         self.tools: Dict[str, Tool] = {
             "add_expense": self.state.add_expense,
             "get_summary": self.state.get_summary,
             "set_savings_goal": self.state.set_savings_goal,
+            "set_category_limit": self.state.set_category_limit,
         }
-        self.client = client or self._create_client()
+        api_key = os.getenv("GROQ_API_KEY")
+        self.client = client or self._create_client(api_key)
         self.message_history: List[Dict[str, Any]] = [
             {"role": "system", "content": SYSTEM_PROMPT}
         ]
 
     @staticmethod
-    def _create_client() -> OpenAI:
+    def _create_client(api_key: Optional[str]) -> openai.OpenAI:
         """Create an OpenAI-compatible client for Groq."""
-        token = os.getenv("GROQ_API_KEY")
-        if not token:
+        if not api_key:
             raise RuntimeError(
                 "GROQ_API_KEY is missing. Add it to .env or set it in the environment."
             )
-        return OpenAI(base_url=GROQ_API_URL, api_key=token)
+        return openai.OpenAI(
+            base_url="https://api.groq.com/openai/v1",
+            api_key=api_key,
+        )
 
     def call_tool(self, name: str, **arguments: Any) -> Dict[str, Any]:
         """Dispatch a tool call by name."""
@@ -192,6 +248,21 @@ class BudgetAgent:
                             "amount": {"type": "number", "exclusiveMinimum": 0}
                         },
                         "required": ["amount"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "set_category_limit",
+                    "description": "Set a spending limit for a specific category to detect overspending.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "category": {"type": "string"},
+                            "limit": {"type": "number", "exclusiveMinimum": 0},
+                        },
+                        "required": ["category", "limit"],
                     },
                 },
             },
